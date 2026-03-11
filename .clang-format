@@ -1,6 +1,7 @@
 ---
 Language: Cpp
 BasedOnStyle: LLVM
+Cpp11BracedListStyle: false
 
 # Indentation & Line Length
 IndentWidth: 4
@@ -12,7 +13,6 @@ AllowShortBlocksOnASingleLine: false
 AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: None
-AllowShortInitializersOnASingleLine: false
 
 # Const Correctness (East Const)
 # Note: Requires clang-format 14 or higher
@@ -27,7 +27,6 @@ AlignAfterOpenBracket: BlockIndent
 BinPackParameters: false
 BinPackArguments: false
 AlwaysBreakAfterReturnType: AllDefinitions
-BreakBeforeClosingParen: Always
 
 # Whitespace
 SpaceAfterCStyleCast: false
@@ -49,9 +48,7 @@ BraceWrapping:
   AfterStruct: true          # Allman default
   AfterUnion: true           # Allman default
   BeforeCatch: true          # Allman default
-  BeforeElse: true           # Allman default
-  
-  BreakBeforeCaseLabels: true
+  BeforeElse: true          # Allman default
 
 IndentCaseLabels: false
 

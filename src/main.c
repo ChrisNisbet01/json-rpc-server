@@ -130,19 +130,20 @@ my_ip_call_cb(
     return content_array;
 }
 
-static tool_definition_st const tool_definitions[]
-    = {{
-           .name = "echo",
-           .description = "Echoes back the input",
-           .list_handler_cb = echo_list_cb,
-           .call_handler_cb = echo_call_cb,
-       },
-       {
-           .name = "My IP address",
-           .description = "Returns my local IP address",
-           .list_handler_cb = my_ip_list_cb,
-           .call_handler_cb = my_ip_call_cb,
-       }};
+static tool_definition_st const tool_definitions[] = {
+    {
+        .name = "echo",
+        .description = "Echoes back the input",
+        .list_handler_cb = echo_list_cb,
+        .call_handler_cb = echo_call_cb,
+    },
+    {
+        .name = "My IP address",
+        .description = "Returns my local IP address",
+        .list_handler_cb = my_ip_list_cb,
+        .call_handler_cb = my_ip_call_cb,
+    },
+};
 
 static tool_definition_st const *
 tool_definition_lookup(char const * name)
@@ -175,6 +176,7 @@ handle_list_tools(rpc_server_st * svr, struct json_object * params, struct json_
     for (size_t i = 0; i < sizeof(tool_definitions) / sizeof(tool_definitions[0]); i++)
     {
         tool_definition_st const * def = &tool_definitions[i];
+
         json_object_array_add(tools_array, def->list_handler_cb(def, svr));
     }
 
@@ -235,7 +237,7 @@ int
 main(int argc, char ** argv)
 {
     int exit_code;
-    rpc_server_st svr = {0};
+    rpc_server_st svr = { 0 };
 
     if (!parse_args(&svr, argc, argv))
     {
