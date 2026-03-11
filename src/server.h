@@ -2,14 +2,13 @@
 
 #include <easy_pc/easy_pc.h>
 #include <json-c/json.h>
+#include <libubox/list.h>
 #include <libubox/uloop.h>
 #include <stdio.h>
 
 typedef struct rpc_server_st rpc_server_st;
 
-typedef struct json_object * (*rpc_handler_fn)(
-    rpc_server_st * svr, struct json_object * params, struct json_object * id
-);
+typedef bool (*rpc_handler_fn)(rpc_server_st * svr, struct json_object * params, struct json_object * id);
 
 typedef struct rpc_method_st
 {
@@ -28,9 +27,12 @@ typedef struct rpc_server_st
 {
     int in_fd;
     int out_fd;
-    FILE * out_fp;
 
     struct uloop_fd stdin_fd;
+    struct uloop_fd out_uloop_fd;
+    struct list_head write_queue;
+    struct list_head tool_calls;
+
     struct
     {
         struct uloop_fd fd;
@@ -42,9 +44,13 @@ typedef struct rpc_server_st
 
     rpc_method_registry_st registry;
 
+    int pending_tools;
+    bool eof_reached;
     int exit_code;
 } rpc_server_st;
 
 void rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_fn handler);
+
+void rpc_server_queue_response(rpc_server_st * svr, struct json_object * res);
 
 void run_server(rpc_server_st * svr, int const in_fd, int const out_fd);

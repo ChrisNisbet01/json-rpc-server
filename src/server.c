@@ -7,22 +7,106 @@
 #include "json_ast_actions.h"
 #include "utils.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <libubox/list.h>
 #include <libubox/uloop.h>
 #include <libubus.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-#if 0
-static void
-print_json_ast(struct json_object * json)
+typedef struct write_queue_entry_st
 {
-    if (json == NULL)
+    struct list_head list;
+    char * buf;
+    size_t len;
+    size_t pos;
+} write_queue_entry_st;
+
+static void
+check_exit_condition(rpc_server_st * svr)
+{
+    if (svr->eof_reached && list_empty(&svr->write_queue) && svr->pending_tools == 0)
     {
-        return;
+        uloop_end();
     }
-    fprintf(stderr, "%s\n", json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
 }
-#endif
+
+static void
+write_queue_cb(struct uloop_fd * u, unsigned int events)
+{
+    UNUSED_PARAM(events);
+    rpc_server_st * const svr = container_of(u, rpc_server_st, out_uloop_fd);
+
+    while (!list_empty(&svr->write_queue))
+    {
+        write_queue_entry_st * entry = list_first_entry(&svr->write_queue, write_queue_entry_st, list);
+
+        ssize_t const bytes_written = write(u->fd, entry->buf + entry->pos, entry->len - entry->pos);
+
+        if (bytes_written < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                /* Output buffer full, wait for next ULOOP_WRITE event. */
+                return;
+            }
+            else if (errno == EINTR)
+            {
+                continue;
+            }
+            else
+            {
+                perror("write_queue_cb: write failed");
+                uloop_end();
+                return;
+            }
+        }
+
+        entry->pos += bytes_written;
+        if (entry->pos == entry->len)
+        {
+            list_del(&entry->list);
+            free(entry->buf);
+            free(entry);
+        }
+    }
+
+    /* Queue is empty, stop monitoring for writability. */
+    uloop_fd_delete(&svr->out_uloop_fd);
+    check_exit_condition(svr);
+}
+
+void
+rpc_server_queue_response(rpc_server_st * svr, struct json_object * res)
+{
+    struct json_object * id = NULL;
+    json_object_object_get_ex(res, "id", &id);
+    fprintf(stderr, "DEBUG: Queuing response (id: %s)\n", id ? json_object_get_string(id) : "null");
+
+    char const * json_str = json_object_to_json_string_ext(res, JSON_C_TO_STRING_PLAIN);
+    size_t const len = strlen(json_str);
+
+    write_queue_entry_st * entry = malloc(sizeof(write_queue_entry_st));
+    /* We add a newline to each response as per JSON-RPC over pipes convention. */
+    entry->len = len + 1;
+    entry->buf = malloc(entry->len);
+    memcpy(entry->buf, json_str, len);
+    entry->buf[len] = '\n';
+    entry->pos = 0;
+
+    bool const was_empty = list_empty(&svr->write_queue);
+    list_add_tail(&entry->list, &svr->write_queue);
+
+    if (was_empty)
+    {
+        uloop_fd_add(&svr->out_uloop_fd, ULOOP_WRITE);
+        /* Try to write immediately. */
+        write_queue_cb(&svr->out_uloop_fd, ULOOP_WRITE);
+    }
+}
 
 void
 rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_fn handler)
@@ -37,8 +121,8 @@ rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_f
     svr->registry.count++;
 }
 
-static struct json_object *
-create_error_response(struct json_object * id, int code, char const * message)
+static void
+queue_error_response(rpc_server_st * svr, struct json_object * id, int code, char const * message)
 {
     struct json_object * res = json_object_new_object();
     json_object_object_add(res, "jsonrpc", json_object_new_string("2.0"));
@@ -57,7 +141,8 @@ create_error_response(struct json_object * id, int code, char const * message)
         json_object_object_add(res, "id", NULL);
     }
 
-    return res;
+    rpc_server_queue_response(svr, res);
+    json_object_put(res);
 }
 
 static void
@@ -85,9 +170,7 @@ handle_rpc_message(rpc_server_st * svr, struct json_object * msg)
     {
         if (id)
         {
-            struct json_object * err = create_error_response(id, -32600, "Invalid Request");
-            printf("%s\n", json_object_to_json_string(err));
-            json_object_put(err);
+            queue_error_response(svr, id, -32600, "Invalid Request");
         }
         return;
     }
@@ -107,36 +190,21 @@ handle_rpc_message(rpc_server_st * svr, struct json_object * msg)
 
     if (handler)
     {
-        struct json_object * result = handler(svr, params, id);
-        if (id)
+        fprintf(
+            stderr, "DEBUG: Handling method '%s' (id: %s)\n", method_name, id ? json_object_get_string(id) : "null"
+        );
+        if (!handler(svr, params, id))
         {
-            struct json_object * res = json_object_new_object();
-            json_object_object_add(res, "jsonrpc", json_object_new_string("2.0"));
-            json_object_object_add(res, "result", result);
-            json_object_object_add(res, "id", json_object_get(id));
-
-            printf("%s\n", json_object_to_json_string(res));
-            json_object_put(res);
-        }
-        else
-        {
-            /* Notification - discard result */
-            json_object_put(result);
+            queue_error_response(svr, id, -32600, "Invalid Request");
         }
     }
     else if (id)
     {
-        struct json_object * err = create_error_response(id, -32601, "Method not found");
-        printf("%s\n", json_object_to_json_string(err));
-        json_object_put(err);
+        fprintf(stderr, "DEBUG: Method '%s' not found (id: %s)\n", method_name, json_object_get_string(id));
+        queue_error_response(svr, id, -32601, "Method not found");
     }
 }
 
-/*
- * This callback is called from the parser worker thread.
- * We must be careful about thread safety.
- * Here we just write a byte to a pipe to wake up the main loop.
- */
 static void
 on_parse_complete(void * user_data)
 {
@@ -156,12 +224,10 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
 
     if (u->eof || u->error)
     {
-        /* TODO: Try and reopen the file? */
         uloop_end();
         return;
     }
 
-    /* Read the character written to the pipe by the parse_completion callback. */
     char cmd;
     bool retry = true;
     do
@@ -182,17 +248,11 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
         retry = false;
     } while (retry);
 
-    /*
-     * The callback only told us 'something finished'.
-     * We MUST call sync_result to move the result from internal storage to session->result.
-     */
     epc_parse_session_sync_result(&svr->session);
 
     if (svr->session.result.is_error)
     {
         fprintf(stderr, "Parse Error: %s\n", svr->session.result.data.error->message);
-        fprintf(stderr, "expected: %s\n", svr->session.result.data.error->expected);
-        fprintf(stderr, "actual: %s\n", svr->session.result.data.error->found);
     }
     else
     {
@@ -201,18 +261,12 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
         void * ast_build_user_data = NULL;
         epc_ast_result_t ast_result = epc_ast_build(svr->session.result.data.success, registry, ast_build_user_data);
 
-        if (ast_result.has_error)
-        {
-            fprintf(stderr, "AST Error: %s\n", ast_result.error_message);
-        }
-        else
+        if (!ast_result.has_error)
         {
             json_node_t * node = ast_result.ast_root;
             struct json_object * json = node->obj;
-            // print_json_ast(json);
 
             handle_rpc_message(svr, json);
-            fflush(stdout);
 
             json_node_free(ast_result.ast_root, ast_build_user_data);
         }
@@ -220,7 +274,8 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
     }
     if (!epc_parse_session_advance(&svr->session, svr->parser))
     {
-        uloop_end();
+        svr->eof_reached = true;
+        check_exit_condition(svr);
     }
 }
 
@@ -233,12 +288,12 @@ stdin_cb(struct uloop_fd * u, unsigned int events)
     if (u->eof)
     {
         epc_streaming_notify_eof(&svr->session);
-        uloop_end();
+        uloop_fd_delete(u);
     }
     else if (u->error)
     {
         epc_streaming_notify_error(&svr->session, EOF);
-        uloop_end();
+        uloop_fd_delete(u);
     }
     else
     {
@@ -258,8 +313,11 @@ void
 run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
 {
     svr->out_fd = out_fd;
-    svr->out_fp = fd_to_out_fp(out_fd);
     svr->in_fd = in_fd;
+
+    /* Set output to non-blocking. */
+    int flags = fcntl(out_fd, F_GETFL, 0);
+    fcntl(out_fd, F_SETFL, flags | O_NONBLOCK);
 
     epc_parser_list * list = epc_parser_list_create();
 
@@ -272,10 +330,15 @@ run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
     }
 
     uloop_init();
+    INIT_LIST_HEAD(&svr->write_queue);
+    INIT_LIST_HEAD(&svr->tool_calls);
 
     svr->stdin_fd.fd = svr->in_fd;
     svr->stdin_fd.cb = stdin_cb;
     uloop_fd_add(&svr->stdin_fd, ULOOP_READ);
+
+    svr->out_uloop_fd.fd = svr->out_fd;
+    svr->out_uloop_fd.cb = write_queue_cb;
 
     if (pipe(svr->completion.pipe) < 0)
     {
