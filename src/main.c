@@ -1,17 +1,18 @@
 #include "server.h"
 #include "utils.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ifaddrs.h>
 #include <libubox/uloop.h>
-#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
 
 static void
 queue_success_response(rpc_server_st * svr, struct json_object * id, struct json_object * result)
@@ -249,8 +250,11 @@ typedef struct tool_call_context_st
     struct runqueue_process run_proc;
     struct uloop_fd pipe_fd;
     struct json_object * id;
+    struct json_object * params;
+    tool_definition_st const * def;
     char * output;
     size_t output_len;
+    bool was_cancelled;
 } tool_call_context_st;
 
 static void
@@ -289,12 +293,34 @@ tool_call_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
     (void)q;
     tool_call_context_st * ctx = container_of(t, tool_call_context_st, run_proc.task);
 
-    fprintf(stderr, "DEBUG: Tool task completed for (id: %s)\n", ctx->id ? json_object_get_string(ctx->id) : "null");
+    fprintf(
+        stderr,
+        "DEBUG: Tool task completed for (id: %s)%s\n",
+        ctx->id ? json_object_get_string(ctx->id) : "null",
+        ctx->was_cancelled ? " [CANCELLED]" : ""
+    );
 
-    /* If there's still data in the pipe, read it. */
+    /* Ensure pipe is cleaned up. */
     if (ctx->pipe_fd.fd != -1)
     {
-        tool_call_pipe_cb(&ctx->pipe_fd, ULOOP_READ);
+        /* Final read if not cancelled. */
+        if (!ctx->was_cancelled)
+        {
+            tool_call_pipe_cb(&ctx->pipe_fd, ULOOP_READ);
+        }
+
+        /* If still open after final read (or if cancelled), close it now. */
+        if (ctx->pipe_fd.fd != -1)
+        {
+            uloop_fd_delete(&ctx->pipe_fd);
+            close(ctx->pipe_fd.fd);
+            ctx->pipe_fd.fd = -1;
+        }
+    }
+
+    if (ctx->was_cancelled)
+    {
+        goto cleanup;
     }
 
     struct json_object * result = json_object_new_object();
@@ -313,13 +339,80 @@ tool_call_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
     json_object_object_add(result, "content", content_array);
     queue_success_response(ctx->svr, ctx->id, result);
 
+cleanup:
     if (ctx->id)
     {
         json_object_put(ctx->id);
     }
+    if (ctx->params)
+    {
+        json_object_put(ctx->params);
+    }
     free(ctx->output);
     free(ctx);
 }
+
+static void
+tool_call_run_cb(struct runqueue * q, struct runqueue_task * t)
+{
+    tool_call_context_st * ctx = container_of(t, tool_call_context_st, run_proc.task);
+    int pipefds[2];
+
+    if (pipe(pipefds) < 0)
+    {
+        perror("pipe failed");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork failed");
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return;
+    }
+
+    if (pid == 0)
+    {
+        /* Child */
+        close(pipefds[0]);
+        ctx->def->run_handler_cb(ctx->def, ctx->svr, ctx->params, pipefds[1]);
+        close(pipefds[1]);
+        exit(0);
+    }
+
+    /* Parent */
+    fprintf(
+        stderr,
+        "DEBUG: Forked process %d for tool '%s' (id: %s)\n",
+        (int)pid,
+        ctx->def->name,
+        ctx->id ? json_object_get_string(ctx->id) : "null"
+    );
+    close(pipefds[1]);
+    int flags = fcntl(pipefds[0], F_GETFL, 0);
+    fcntl(pipefds[0], F_SETFL, flags | O_NONBLOCK);
+
+    ctx->pipe_fd.fd = pipefds[0];
+    uloop_fd_add(&ctx->pipe_fd, ULOOP_READ);
+
+    runqueue_process_add(q, &ctx->run_proc, pid);
+}
+
+static void
+tool_call_cancel_cb(struct runqueue * q, struct runqueue_task * t, int type)
+{
+    tool_call_context_st * ctx = container_of(t, tool_call_context_st, run_proc.task);
+    ctx->was_cancelled = true;
+    runqueue_process_cancel_cb(q, t, type);
+}
+
+static const struct runqueue_task_type tool_call_type = {
+    .run = tool_call_run_cb,
+    .cancel = tool_call_cancel_cb,
+    .kill = runqueue_process_kill_cb,
+};
 
 struct cancel_ctx
 {
@@ -336,7 +429,13 @@ cancel_task_cb(void * ptr, struct safe_list * list)
 
     if (call_ctx->id && strcmp(json_object_get_string(call_ctx->id), ctx->request_id) == 0)
     {
-        fprintf(stderr, "DEBUG: Cancelling request %s (pid: %d)\n", ctx->request_id, (int)call_ctx->run_proc.proc.pid);
+        fprintf(
+            stderr,
+            "DEBUG: Cancelling request %s (pid: %d)\n",
+            ctx->request_id,
+            (int)call_ctx->run_proc.proc.pid
+        );
+        call_ctx->was_cancelled = true;
         runqueue_task_cancel(t, SIGTERM);
         ctx->found = true;
         return 1; /* Stop iteration */
@@ -374,7 +473,7 @@ handle_call_tool(rpc_server_st * svr, struct json_object * params, struct json_o
     }
 
     char const * name = json_object_get_string(name_obj);
-    fprintf(stderr, "DEBUG: Handling call for tool '%s' (id: %s)\n", name, id ? json_object_get_string(id) : "null");
+    fprintf(stderr, "DEBUG: Queuing call for tool '%s' (id: %s)\n", name, id ? json_object_get_string(id) : "null");
 
     tool_definition_st const * def = tool_definition_lookup(name);
     if (def == NULL)
@@ -383,52 +482,17 @@ handle_call_tool(rpc_server_st * svr, struct json_object * params, struct json_o
         return false;
     }
 
-    int pipefds[2];
-    if (pipe(pipefds) < 0)
-    {
-        perror("pipe failed");
-        return false;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        perror("fork failed");
-        close(pipefds[0]);
-        close(pipefds[1]);
-        return false;
-    }
-
-    if (pid == 0)
-    {
-        /* Child */
-        close(pipefds[0]);
-        def->run_handler_cb(def, svr, params, pipefds[1]);
-        close(pipefds[1]);
-        exit(0);
-    }
-
-    /* Parent */
-    fprintf(
-        stderr,
-        "DEBUG: Forked process %d for tool '%s' (id: %s)\n",
-        (int)pid,
-        name,
-        id ? json_object_get_string(id) : "null"
-    );
-    close(pipefds[1]);
-    int flags = fcntl(pipefds[0], F_GETFL, 0);
-    fcntl(pipefds[0], F_SETFL, flags | O_NONBLOCK);
-
     tool_call_context_st * ctx = calloc(1, sizeof(tool_call_context_st));
     ctx->svr = svr;
+    ctx->def = def;
     ctx->id = id ? json_object_get(id) : NULL;
-    ctx->pipe_fd.fd = pipefds[0];
+    ctx->params = params ? json_object_get(params) : NULL;
     ctx->pipe_fd.cb = tool_call_pipe_cb;
+    ctx->pipe_fd.fd = -1;
+    ctx->run_proc.task.type = &tool_call_type;
     ctx->run_proc.task.complete = tool_call_task_complete_cb;
 
-    uloop_fd_add(&ctx->pipe_fd, ULOOP_READ);
-    runqueue_process_add(&svr->tool_queue, &ctx->run_proc, pid);
+    runqueue_task_add(&svr->tool_queue, &ctx->run_proc.task, false);
 
     return true;
 }

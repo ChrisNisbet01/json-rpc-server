@@ -8,12 +8,11 @@
 #include "utils.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <libubox/list.h>
 #include <libubox/runqueue.h>
 #include <libubox/uloop.h>
 #include <libubus.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -91,7 +90,7 @@ rpc_server_queue_response(rpc_server_st * svr, struct json_object * res)
     char const * json_str = json_object_to_json_string_ext(res, JSON_C_TO_STRING_PLAIN);
     size_t const len = strlen(json_str);
 
-    write_queue_entry_st * entry = malloc(sizeof(write_queue_entry_st));
+    write_queue_entry_st * entry = malloc(sizeof(*entry));
     /* We add a newline to each response as per JSON-RPC over pipes convention. */
     entry->len = len + 1;
     entry->buf = malloc(entry->len);
@@ -116,7 +115,7 @@ rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_f
     if (svr->registry.count == svr->registry.capacity)
     {
         svr->registry.capacity = svr->registry.capacity == 0 ? 8 : svr->registry.capacity * 2;
-        svr->registry.methods = realloc(svr->registry.methods, svr->registry.capacity * sizeof(rpc_method_st));
+        svr->registry.methods = realloc(svr->registry.methods, svr->registry.capacity * sizeof(*svr->registry.methods));
     }
     svr->registry.methods[svr->registry.count].name = strdup(name);
     svr->registry.methods[svr->registry.count].handler = handler;
@@ -334,6 +333,7 @@ run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
     uloop_init();
     INIT_LIST_HEAD(&svr->write_queue);
     runqueue_init(&svr->tool_queue);
+    svr->tool_queue.max_running_tasks = 4;
 
     svr->stdin_fd.fd = svr->in_fd;
     svr->stdin_fd.cb = stdin_cb;
