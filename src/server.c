@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#if 0
 static void
 print_json_ast(struct json_object * json)
 {
@@ -21,6 +22,7 @@ print_json_ast(struct json_object * json)
     }
     fprintf(stderr, "%s\n", json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
 }
+#endif
 
 void
 rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_fn handler)
@@ -207,7 +209,7 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
         {
             json_node_t * node = ast_result.ast_root;
             struct json_object * json = node->obj;
-            print_json_ast(json);
+            // print_json_ast(json);
 
             handle_rpc_message(svr, json);
             fflush(stdout);
