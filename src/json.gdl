@@ -10,12 +10,12 @@ EscapedChar = SimpleEscape | UnicodeEscape;
 NonQuoteNonBackslash = noneof("\\\"");
 StringContentChar = NonQuoteNonBackslash | EscapedChar;
 
-Comma = stripl(',');
-OBracket = stripl('[');
+Comma = strip(',');
+OBracket = strip('[');
 CBracket = stripl(']');
-OObject = stripl('{');
+OObject = strip('{');
 CObject = stripl('}');
-Colon = stripl(':');
+Colon = strip(':');
 
 True = "true";
 False = "false";

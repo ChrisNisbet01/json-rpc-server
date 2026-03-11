@@ -19,7 +19,115 @@ print_json_ast(struct json_object * json)
     {
         return;
     }
-    printf("%s\n", json_object_to_json_string(json));
+    fprintf(stderr, "%s\n", json_object_to_json_string_ext(json, JSON_C_TO_STRING_PRETTY));
+}
+
+void
+rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_fn handler)
+{
+    if (svr->registry.count == svr->registry.capacity)
+    {
+        svr->registry.capacity = svr->registry.capacity == 0 ? 8 : svr->registry.capacity * 2;
+        svr->registry.methods = realloc(svr->registry.methods, svr->registry.capacity * sizeof(rpc_method_st));
+    }
+    svr->registry.methods[svr->registry.count].name = strdup(name);
+    svr->registry.methods[svr->registry.count].handler = handler;
+    svr->registry.count++;
+}
+
+static struct json_object *
+create_error_response(struct json_object * id, int code, char const * message)
+{
+    struct json_object * res = json_object_new_object();
+    json_object_object_add(res, "jsonrpc", json_object_new_string("2.0"));
+
+    struct json_object * error = json_object_new_object();
+    json_object_object_add(error, "code", json_object_new_int(code));
+    json_object_object_add(error, "message", json_object_new_string(message));
+    json_object_object_add(res, "error", error);
+
+    if (id)
+    {
+        json_object_object_add(res, "id", json_object_get(id));
+    }
+    else
+    {
+        json_object_object_add(res, "id", NULL);
+    }
+
+    return res;
+}
+
+static void
+handle_rpc_message(rpc_server_st * svr, struct json_object * msg)
+{
+    struct json_object * id = NULL;
+    struct json_object * method_obj = NULL;
+    struct json_object * params = NULL;
+    struct json_object * version = NULL;
+
+    if (!json_object_is_type(msg, json_type_object))
+    {
+        return;
+    }
+
+    if (!json_object_object_get_ex(msg, "jsonrpc", &version) || strcmp(json_object_get_string(version), "2.0") != 0)
+    {
+        /* Not JSON-RPC 2.0 */
+        return;
+    }
+
+    json_object_object_get_ex(msg, "id", &id);
+
+    if (!json_object_object_get_ex(msg, "method", &method_obj) || !json_object_is_type(method_obj, json_type_string))
+    {
+        if (id)
+        {
+            struct json_object * err = create_error_response(id, -32600, "Invalid Request");
+            printf("%s\n", json_object_to_json_string(err));
+            json_object_put(err);
+        }
+        return;
+    }
+
+    char const * method_name = json_object_get_string(method_obj);
+    json_object_object_get_ex(msg, "params", &params);
+
+    rpc_handler_fn handler = NULL;
+    for (size_t i = 0; i < svr->registry.count; i++)
+    {
+        if (strcmp(svr->registry.methods[i].name, method_name) == 0)
+        {
+            handler = svr->registry.methods[i].handler;
+            break;
+        }
+    }
+
+    if (handler)
+    {
+        struct json_object * result = handler(svr, params, id);
+        if (id)
+        {
+            struct json_object * res = json_object_new_object();
+            json_object_object_add(res, "jsonrpc", json_object_new_string("2.0"));
+            json_object_object_add(res, "result", result);
+            json_object_object_add(res, "id", json_object_get(id));
+
+            printf("%s\n", json_object_to_json_string(res));
+            json_object_put(res);
+        }
+        else
+        {
+            /* Notification - discard result */
+            json_object_put(result);
+        }
+    }
+    else if (id)
+    {
+        struct json_object * err = create_error_response(id, -32601, "Method not found");
+        printf("%s\n", json_object_to_json_string(err));
+        json_object_put(err);
+    }
 }
 
 /*
@@ -86,13 +194,6 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
     }
     else
     {
-        printf("\n---JSON Parsed ---\n");
-        char * cpt_str = epc_cpt_to_string(svr->session.internal_parse_ctx, svr->session.result.data.success);
-        if (cpt_str)
-        {
-            printf("%s\n", cpt_str);
-            free(cpt_str);
-        }
         epc_ast_hook_registry_t * registry = epc_ast_hook_registry_create(JSON_AST_ACTION_COUNT__);
         json_ast_hook_registry_init(registry);
         void * ast_build_user_data = NULL;
@@ -104,14 +205,17 @@ parse_completion_cb(struct uloop_fd * u, unsigned int events)
         }
         else
         {
-            fprintf(stderr, "AST parsed\n");
             json_node_t * node = ast_result.ast_root;
             struct json_object * json = node->obj;
             print_json_ast(json);
+
+            handle_rpc_message(svr, json);
+            fflush(stdout);
+
             json_node_free(ast_result.ast_root, ast_build_user_data);
         }
+        epc_ast_hook_registry_free(registry);
     }
-    printf("Advancing to next JSON message...\n");
     if (!epc_parse_session_advance(&svr->session, svr->parser))
     {
         uloop_end();
