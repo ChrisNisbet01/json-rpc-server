@@ -1,17 +1,17 @@
 #include "server.h"
 #include "utils.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <libubox/uloop.h>
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <ifaddrs.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 
 static void
 queue_success_response(rpc_server_st * svr, struct json_object * id, struct json_object * result)
@@ -245,9 +245,8 @@ handle_list_tools(rpc_server_st * svr, struct json_object * params, struct json_
 
 typedef struct tool_call_context_st
 {
-    struct list_head list;
     rpc_server_st * svr;
-    struct uloop_process proc;
+    struct runqueue_process run_proc;
     struct uloop_fd pipe_fd;
     struct json_object * id;
     char * output;
@@ -285,17 +284,12 @@ tool_call_pipe_cb(struct uloop_fd * u, unsigned int events)
 }
 
 static void
-tool_call_proc_cb(struct uloop_process * c, int ret)
+tool_call_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
 {
-    UNUSED_PARAM(ret);
-    tool_call_context_st * ctx = container_of(c, tool_call_context_st, proc);
+    (void)q;
+    tool_call_context_st * ctx = container_of(t, tool_call_context_st, run_proc.task);
 
-    fprintf(
-        stderr,
-        "DEBUG: Tool process (pid: %d) exited for (id: %s)\n",
-        (int)ctx->proc.pid,
-        ctx->id ? json_object_get_string(ctx->id) : "null"
-    );
+    fprintf(stderr, "DEBUG: Tool task completed for (id: %s)\n", ctx->id ? json_object_get_string(ctx->id) : "null");
 
     /* If there's still data in the pipe, read it. */
     if (ctx->pipe_fd.fd != -1)
@@ -323,10 +317,51 @@ tool_call_proc_cb(struct uloop_process * c, int ret)
     {
         json_object_put(ctx->id);
     }
-    list_del(&ctx->list);
     free(ctx->output);
-    ctx->svr->pending_tools--;
     free(ctx);
+}
+
+struct cancel_ctx
+{
+    char const * request_id;
+    bool found;
+};
+
+static int
+cancel_task_cb(void * ptr, struct safe_list * list)
+{
+    struct cancel_ctx * ctx = ptr;
+    struct runqueue_task * t = container_of(list, struct runqueue_task, list);
+    tool_call_context_st * call_ctx = container_of(t, tool_call_context_st, run_proc.task);
+
+    if (call_ctx->id && strcmp(json_object_get_string(call_ctx->id), ctx->request_id) == 0)
+    {
+        fprintf(stderr, "DEBUG: Cancelling request %s (pid: %d)\n", ctx->request_id, (int)call_ctx->run_proc.proc.pid);
+        runqueue_task_cancel(t, SIGTERM);
+        ctx->found = true;
+        return 1; /* Stop iteration */
+    }
+    return 0;
+}
+
+static bool
+handle_cancel_request(rpc_server_st * svr, struct json_object * params, struct json_object * id)
+{
+    (void)id;
+    struct json_object * request_id_obj = NULL;
+    if (!json_object_object_get_ex(params, "requestId", &request_id_obj))
+    {
+        return false;
+    }
+
+    struct cancel_ctx ctx = { .request_id = json_object_get_string(request_id_obj), .found = false };
+
+    safe_list_for_each(&svr->tool_queue.tasks_active, cancel_task_cb, &ctx);
+    if (!ctx.found)
+    {
+        safe_list_for_each(&svr->tool_queue.tasks_inactive, cancel_task_cb, &ctx);
+    }
+    return true;
 }
 
 static bool
@@ -347,7 +382,7 @@ handle_call_tool(rpc_server_st * svr, struct json_object * params, struct json_o
         fprintf(stderr, "DEBUG: Tool '%s' not found\n", name);
         return false;
     }
-    fprintf(stderr, "DEBUG: Tool '%s' found\n", def->name);
+
     int pipefds[2];
     if (pipe(pipefds) < 0)
     {
@@ -390,13 +425,10 @@ handle_call_tool(rpc_server_st * svr, struct json_object * params, struct json_o
     ctx->id = id ? json_object_get(id) : NULL;
     ctx->pipe_fd.fd = pipefds[0];
     ctx->pipe_fd.cb = tool_call_pipe_cb;
-    ctx->proc.pid = pid;
-    ctx->proc.cb = tool_call_proc_cb;
+    ctx->run_proc.task.complete = tool_call_task_complete_cb;
 
-    list_add_tail(&ctx->list, &svr->tool_calls);
-    svr->pending_tools++;
     uloop_fd_add(&ctx->pipe_fd, ULOOP_READ);
-    uloop_process_add(&ctx->proc);
+    runqueue_process_add(&svr->tool_queue, &ctx->run_proc, pid);
 
     return true;
 }
@@ -441,6 +473,7 @@ main(int argc, char ** argv)
     rpc_server_register_method(&svr, "initialize", handle_initialize);
     rpc_server_register_method(&svr, "tools/list", handle_list_tools);
     rpc_server_register_method(&svr, "tools/call", handle_call_tool);
+    rpc_server_register_method(&svr, "notifications/cancel", handle_cancel_request);
 
     run_server(&svr, STDIN_FILENO, STDOUT_FILENO);
 

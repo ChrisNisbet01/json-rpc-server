@@ -3,6 +3,7 @@
 #include <easy_pc/easy_pc.h>
 #include <json-c/json.h>
 #include <libubox/list.h>
+#include <libubox/runqueue.h>
 #include <libubox/uloop.h>
 #include <stdio.h>
 
@@ -31,7 +32,7 @@ typedef struct rpc_server_st
     struct uloop_fd stdin_fd;
     struct uloop_fd out_uloop_fd;
     struct list_head write_queue;
-    struct list_head tool_calls;
+    struct runqueue tool_queue;
 
     struct
     {
@@ -44,7 +45,6 @@ typedef struct rpc_server_st
 
     rpc_method_registry_st registry;
 
-    int pending_tools;
     bool eof_reached;
     int exit_code;
 } rpc_server_st;

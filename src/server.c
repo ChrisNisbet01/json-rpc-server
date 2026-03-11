@@ -8,10 +8,12 @@
 #include "utils.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <libubox/list.h>
+#include <libubox/runqueue.h>
 #include <libubox/uloop.h>
 #include <libubus.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,7 +30,7 @@ typedef struct write_queue_entry_st
 static void
 check_exit_condition(rpc_server_st * svr)
 {
-    if (svr->eof_reached && list_empty(&svr->write_queue) && svr->pending_tools == 0)
+    if (svr->eof_reached && list_empty(&svr->write_queue) && list_empty(&svr->tool_queue.tasks_active.list))
     {
         uloop_end();
     }
@@ -331,7 +333,7 @@ run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
 
     uloop_init();
     INIT_LIST_HEAD(&svr->write_queue);
-    INIT_LIST_HEAD(&svr->tool_calls);
+    runqueue_init(&svr->tool_queue);
 
     svr->stdin_fd.fd = svr->in_fd;
     svr->stdin_fd.cb = stdin_cb;
@@ -353,6 +355,7 @@ run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
     svr->session = epc_parse_fd_reactive(svr->parser, in_fd, on_parse_complete, svr, NULL);
 
     run(svr);
+    runqueue_kill(&svr->tool_queue);
     uloop_done();
 
     epc_parse_session_destroy(&svr->session);
