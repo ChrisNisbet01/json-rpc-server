@@ -1,18 +1,18 @@
 #include "server.h"
 #include "utils.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <libubox/uloop.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <ifaddrs.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <signal.h>
 
 static void
 queue_success_response(rpc_server_st * svr, struct json_object * id, struct json_object * result)
@@ -102,12 +102,9 @@ echo_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct j
     (void)definition;
     (void)svr;
 
-    struct json_object * content_array = json_object_new_array();
-
     struct json_object * args = NULL;
     json_object_object_get_ex(params, "arguments", &args);
-    struct json_object * message_obj = NULL;
-    json_object_object_get_ex(args, "message", &message_obj);
+
     struct json_object * delay_obj = NULL;
     json_object_object_get_ex(args, "delay", &delay_obj);
 
@@ -116,14 +113,10 @@ echo_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct j
         sleep(json_object_get_int(delay_obj));
     }
 
-    struct json_object * content = json_object_new_object();
-    json_object_object_add(content, "type", json_object_new_string("text"));
+    struct json_object * message_obj = NULL;
+    json_object_object_get_ex(args, "message", &message_obj);
     char const * msg = message_obj ? json_object_get_string(message_obj) : "";
-    json_object_object_add(content, "text", json_object_new_string(msg));
-    json_object_array_add(content_array, content);
-
-    dprintf(out_fd, "%s", json_object_to_json_string(content_array));
-    json_object_put(content_array);
+    dprintf(out_fd, "%s", msg);
 }
 
 static struct json_object *
@@ -172,21 +165,12 @@ my_ip_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct 
             }
         }
     }
-
-    struct json_object * content = json_object_new_object();
-    json_object_object_add(content, "type", json_object_new_string("text"));
-    json_object_object_add(content, "text", json_object_new_string(ip));
-
-    if (addrs)
+    if (addrs != NULL)
     {
         freeifaddrs(addrs);
     }
 
-    struct json_object * content_array = json_object_new_array();
-    json_object_array_add(content_array, content);
-
-    dprintf(out_fd, "%s", json_object_to_json_string(content_array));
-    json_object_put(content_array);
+    dprintf(out_fd, "%s", ip);
 }
 
 static tool_definition_st const tool_definitions[] = {
@@ -326,12 +310,16 @@ tool_call_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
     struct json_object * result = json_object_new_object();
     struct json_object * content_array = NULL;
 
-    if (ctx->output)
+    if (ctx->output != NULL)
     {
-        content_array = json_tokener_parse(ctx->output);
-    }
+        struct json_object * content = json_object_new_object();
+        json_object_object_add(content, "type", json_object_new_string("text"));
+        json_object_object_add(content, "text", json_object_new_string(ctx->output));
 
-    if (!content_array)
+        content_array = json_object_new_array();
+        json_object_array_add(content_array, content);
+    }
+    else
     {
         content_array = json_object_new_array();
     }
@@ -414,33 +402,37 @@ static const struct runqueue_task_type tool_call_type = {
     .kill = runqueue_process_kill_cb,
 };
 
-struct cancel_ctx
+struct lookup_ctx
 {
-    char const * request_id;
-    bool found;
+    struct json_object * id;
+    tool_call_context_st * call_ctx;
 };
 
 static int
-cancel_task_cb(void * ptr, struct safe_list * list)
+lookup_call_ctx_cb(void * ptr, struct safe_list * list)
 {
-    struct cancel_ctx * ctx = ptr;
+    struct lookup_ctx * ctx = ptr;
+    struct json_object * id = ctx->id;
     struct runqueue_task * t = container_of(list, struct runqueue_task, list);
     tool_call_context_st * call_ctx = container_of(t, tool_call_context_st, run_proc.task);
+    struct json_object * call_id = call_ctx->id;
 
-    if (call_ctx->id && strcmp(json_object_get_string(call_ctx->id), ctx->request_id) == 0)
+    if (json_object_get_type(call_id) == json_object_get_type(id)
+        || strcmp(json_object_get_string(call_id), json_object_get_string(id)) == 0)
     {
-        fprintf(
-            stderr,
-            "DEBUG: Cancelling request %s (pid: %d)\n",
-            ctx->request_id,
-            (int)call_ctx->run_proc.proc.pid
-        );
-        call_ctx->was_cancelled = true;
-        runqueue_task_cancel(t, SIGTERM);
-        ctx->found = true;
-        return 1; /* Stop iteration */
+        ctx->call_ctx = call_ctx;
     }
-    return 0;
+
+    return ctx->call_ctx != NULL; /* Stop iteration if the context has been found. */
+}
+
+tool_call_context_st *
+call_ctx_lookup_by_id(struct json_object * id, struct safe_list * list)
+{
+    struct lookup_ctx ctx = { .id = id };
+
+    safe_list_for_each(list, lookup_call_ctx_cb, &ctx);
+    return ctx.call_ctx;
 }
 
 static bool
@@ -452,13 +444,34 @@ handle_cancel_request(rpc_server_st * svr, struct json_object * params, struct j
     {
         return false;
     }
-
-    struct cancel_ctx ctx = { .request_id = json_object_get_string(request_id_obj), .found = false };
-
-    safe_list_for_each(&svr->tool_queue.tasks_active, cancel_task_cb, &ctx);
-    if (!ctx.found)
+    tool_call_context_st * call_ctx = call_ctx_lookup_by_id(request_id_obj, &svr->tool_queue.tasks_active);
+    if (call_ctx == NULL)
     {
-        safe_list_for_each(&svr->tool_queue.tasks_inactive, cancel_task_cb, &ctx);
+        call_ctx = call_ctx_lookup_by_id(request_id_obj, &svr->tool_queue.tasks_inactive);
+    }
+
+    if (call_ctx != NULL)
+    {
+        fprintf(
+            stderr,
+            "DEBUG: Cancelling request %s (pid: %d)\n",
+            json_object_get_string(request_id_obj),
+            (int)call_ctx->run_proc.proc.pid
+        );
+        call_ctx->was_cancelled = true;
+
+        struct runqueue_task * t = &call_ctx->run_proc.task;
+
+        runqueue_task_cancel(t, SIGTERM);
+    }
+    else
+    {
+        fprintf(
+            stderr,
+            "DEBUG: Request %s (%s) not found\n",
+            json_object_get_string(request_id_obj),
+            json_type_to_name(json_object_get_type(request_id_obj))
+        );
     }
     return true;
 }
@@ -485,8 +498,8 @@ handle_call_tool(rpc_server_st * svr, struct json_object * params, struct json_o
     tool_call_context_st * ctx = calloc(1, sizeof(tool_call_context_st));
     ctx->svr = svr;
     ctx->def = def;
-    ctx->id = id ? json_object_get(id) : NULL;
-    ctx->params = params ? json_object_get(params) : NULL;
+    ctx->id = id != NULL ? json_object_get(id) : NULL;
+    ctx->params = params != NULL ? json_object_get(params) : NULL;
     ctx->pipe_fd.cb = tool_call_pipe_cb;
     ctx->pipe_fd.fd = -1;
     ctx->run_proc.task.type = &tool_call_type;
@@ -537,7 +550,7 @@ main(int argc, char ** argv)
     rpc_server_register_method(&svr, "initialize", handle_initialize);
     rpc_server_register_method(&svr, "tools/list", handle_list_tools);
     rpc_server_register_method(&svr, "tools/call", handle_call_tool);
-    rpc_server_register_method(&svr, "notifications/cancel", handle_cancel_request);
+    rpc_server_register_method(&svr, "notifications/cancelled", handle_cancel_request);
 
     run_server(&svr, STDIN_FILENO, STDOUT_FILENO);
 
