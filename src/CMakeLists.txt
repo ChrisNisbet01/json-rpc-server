@@ -13,6 +13,7 @@ epc_generate_grammar(
 set(SOURCE_FILES 
   main.c
   server.c
+  handlers.c
   utils.c
   json_ast_actions.c
 )

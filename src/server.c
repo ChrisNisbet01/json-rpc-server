@@ -2,6 +2,7 @@
 
 #include "easy_pc/easy_pc_ast.h"
 
+#include "handlers.h"
 #include "json.h"
 #include "json_ast.h"
 #include "json_ast_actions.h"
@@ -334,6 +335,8 @@ run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
     INIT_LIST_HEAD(&svr->write_queue);
     runqueue_init(&svr->tool_queue);
     svr->tool_queue.max_running_tasks = 4;
+
+    rpc_server_register_handlers(svr);
 
     svr->stdin_fd.fd = svr->in_fd;
     svr->stdin_fd.cb = stdin_cb;
