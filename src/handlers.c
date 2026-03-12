@@ -1,4 +1,5 @@
 #include "handlers.h"
+
 #include "server.h"
 #include "utils.h"
 
@@ -234,6 +235,105 @@ get_date_run_cb(tool_definition_st const * definition, rpc_server_st * svr, stru
     perror("execlp failed");
 }
 
+static struct json_object *
+ps_list_cb(tool_definition_st const * definition, rpc_server_st * svr)
+{
+    (void)svr;
+
+    struct json_object * tool = json_object_new_object();
+    json_object_object_add(tool, "name", json_object_new_string(definition->name));
+    json_object_object_add(tool, "description", json_object_new_string(definition->description));
+
+    struct json_object * input_schema = json_object_new_object();
+    json_object_object_add(input_schema, "type", json_object_new_string("object"));
+
+    struct json_object * properties = json_object_new_object();
+
+    struct json_object * all_prop = json_object_new_object();
+    json_object_object_add(all_prop, "type", json_object_new_string("boolean"));
+    json_object_object_add(all_prop, "description", json_object_new_string("Show processes for all users ('a')"));
+    json_object_object_add(properties, "all", all_prop);
+
+    struct json_object * user_prop = json_object_new_object();
+    json_object_object_add(user_prop, "type", json_object_new_string("boolean"));
+    json_object_object_add(user_prop, "description", json_object_new_string("Display user-oriented format ('u')"));
+    json_object_object_add(properties, "user", user_prop);
+
+    struct json_object * extra_prop = json_object_new_object();
+    json_object_object_add(extra_prop, "type", json_object_new_string("boolean"));
+    json_object_object_add(
+        extra_prop, "description", json_object_new_string("Show processes not attached to a tty ('x')")
+    );
+    json_object_object_add(properties, "extra", extra_prop);
+
+    json_object_object_add(input_schema, "properties", properties);
+    json_object_object_add(tool, "inputSchema", input_schema);
+
+    return tool;
+}
+
+static void
+ps_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct json_object * params, int out_fd)
+{
+    (void)definition;
+    (void)svr;
+
+    struct json_object * args = NULL;
+    json_object_object_get_ex(params, "arguments", &args);
+
+    bool a = false, u = false, x = false;
+    struct json_object * tmp;
+    if (json_object_object_get_ex(args, "all", &tmp))
+    {
+        a = json_object_get_boolean(tmp);
+    }
+    if (json_object_object_get_ex(args, "user", &tmp))
+    {
+        u = json_object_get_boolean(tmp);
+    }
+    if (json_object_object_get_ex(args, "extra", &tmp))
+    {
+        x = json_object_get_boolean(tmp);
+    }
+
+    char flags[4] = { 0 };
+    int i = 0;
+    if (a)
+    {
+        flags[i++] = 'a';
+    }
+    if (u)
+    {
+        flags[i++] = 'u';
+    }
+    if (x)
+    {
+        flags[i++] = 'x';
+    }
+
+    if (dup2(out_fd, STDOUT_FILENO) < 0)
+    {
+        perror("dup2 failed");
+        return;
+    }
+    close(out_fd);
+
+    char * argv[3];
+    argv[0] = "ps";
+    if (i > 0)
+    {
+        argv[1] = flags;
+        argv[2] = NULL;
+    }
+    else
+    {
+        argv[1] = NULL;
+    }
+
+    execvp("ps", argv);
+    perror("execvp failed");
+}
+
 static tool_definition_st const tool_definitions[] = {
     {
         .name = "echo",
@@ -252,6 +352,12 @@ static tool_definition_st const tool_definitions[] = {
         .description = "Returns the current date and time",
         .list_handler_cb = get_date_list_cb,
         .run_handler_cb = get_date_run_cb,
+    },
+    {
+        .name = "ps",
+        .description = "List running processes",
+        .list_handler_cb = ps_list_cb,
+        .run_handler_cb = ps_run_cb,
     },
 };
 
@@ -339,6 +445,31 @@ tool_call_pipe_cb(struct uloop_fd * u, unsigned int events)
 }
 
 static void
+queue_success_content(rpc_server_st * svr, struct json_object * id, char const * output)
+{
+    struct json_object * content_array;
+
+    if (output != NULL)
+    {
+        struct json_object * content = json_object_new_object();
+        json_object_object_add(content, "type", json_object_new_string("text"));
+        json_object_object_add(content, "text", json_object_new_string(output));
+
+        content_array = json_object_new_array();
+        json_object_array_add(content_array, content);
+    }
+    else
+    {
+        content_array = json_object_new_array();
+    }
+
+    struct json_object * result = json_object_new_object();
+
+    json_object_object_add(result, "content", content_array);
+    queue_success_response(svr, id, result);
+}
+
+static void
 tool_call_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
 {
     (void)q;
@@ -374,25 +505,7 @@ tool_call_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
         goto cleanup;
     }
 
-    struct json_object * result = json_object_new_object();
-    struct json_object * content_array = NULL;
-
-    if (ctx->output != NULL)
-    {
-        struct json_object * content = json_object_new_object();
-        json_object_object_add(content, "type", json_object_new_string("text"));
-        json_object_object_add(content, "text", json_object_new_string(ctx->output));
-
-        content_array = json_object_new_array();
-        json_object_array_add(content_array, content);
-    }
-    else
-    {
-        content_array = json_object_new_array();
-    }
-
-    json_object_object_add(result, "content", content_array);
-    queue_success_response(ctx->svr, ctx->id, result);
+    queue_success_content(ctx->svr, ctx->id, ctx->output);
 
 cleanup:
     if (ctx->id)
@@ -404,6 +517,7 @@ cleanup:
         json_object_put(ctx->params);
     }
     free(ctx->output);
+    ctx->output = NULL;
     free(ctx);
 }
 
