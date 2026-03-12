@@ -109,6 +109,17 @@ rpc_server_queue_response(rpc_server_st * svr, struct json_object * res)
         write_queue_cb(&svr->out_uloop_fd, ULOOP_WRITE);
     }
 }
+static void
+rpc_server_registry_cleanup(rpc_server_st * svr)
+{
+    for (size_t i = 0; i < svr->registry.count; i++)
+    {
+        free(svr->registry.methods[i].name);
+    }
+    free(svr->registry.methods);
+    svr->registry.count = 0;
+    svr->registry.capacity = 0;
+}
 
 void
 rpc_server_register_method(rpc_server_st * svr, char const * name, rpc_handler_fn handler)
@@ -358,6 +369,8 @@ run_server(rpc_server_st * const svr, int const in_fd, int const out_fd)
     svr->session = epc_parse_fd_reactive(svr->parser, in_fd, on_parse_complete, svr, NULL);
 
     run(svr);
+
+    rpc_server_registry_cleanup(svr);
     runqueue_kill(&svr->tool_queue);
     uloop_done();
 

@@ -175,6 +175,65 @@ my_ip_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct 
     dprintf(out_fd, "%s", ip);
 }
 
+static struct json_object *
+get_date_list_cb(tool_definition_st const * definition, rpc_server_st * svr)
+{
+    (void)svr;
+
+    struct json_object * tool = json_object_new_object();
+    json_object_object_add(tool, "name", json_object_new_string(definition->name));
+    json_object_object_add(tool, "description", json_object_new_string(definition->description));
+
+    struct json_object * input_schema = json_object_new_object();
+    json_object_object_add(input_schema, "type", json_object_new_string("object"));
+
+    struct json_object * properties = json_object_new_object();
+    struct json_object * utc_prop = json_object_new_object();
+    json_object_object_add(utc_prop, "type", json_object_new_string("boolean"));
+    json_object_object_add(utc_prop, "description", json_object_new_string("Display time in UTC"));
+    json_object_object_add(properties, "utc", utc_prop);
+
+    json_object_object_add(input_schema, "properties", properties);
+    json_object_object_add(tool, "inputSchema", input_schema);
+
+    return tool;
+}
+
+static void
+get_date_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct json_object * params, int out_fd)
+{
+    (void)definition;
+    (void)svr;
+
+    struct json_object * args = NULL;
+    json_object_object_get_ex(params, "arguments", &args);
+
+    struct json_object * utc_obj = NULL;
+    bool is_utc = false;
+    if (json_object_object_get_ex(args, "utc", &utc_obj))
+    {
+        is_utc = json_object_get_boolean(utc_obj);
+    }
+
+    if (dup2(out_fd, STDOUT_FILENO) < 0)
+    {
+        perror("dup2 failed");
+        return;
+    }
+    close(out_fd);
+
+    if (is_utc)
+    {
+        execlp("date", "date", "-u", (char *)NULL);
+    }
+    else
+    {
+        execlp("date", "date", (char *)NULL);
+    }
+
+    perror("execlp failed");
+}
+
 static tool_definition_st const tool_definitions[] = {
     {
         .name = "echo",
@@ -187,6 +246,12 @@ static tool_definition_st const tool_definitions[] = {
         .description = "Returns my local IP address",
         .list_handler_cb = my_ip_list_cb,
         .run_handler_cb = my_ip_run_cb,
+    },
+    {
+        .name = "get_date",
+        .description = "Returns the current date and time",
+        .list_handler_cb = get_date_list_cb,
+        .run_handler_cb = get_date_run_cb,
     },
 };
 
