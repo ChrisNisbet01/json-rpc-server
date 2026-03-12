@@ -24,3 +24,5 @@ str_is_empty(char const * const str)
 
 FILE * fd_to_out_fp(int const fd);
 
+void current_timestamp_str(char * buf, size_t len);
+

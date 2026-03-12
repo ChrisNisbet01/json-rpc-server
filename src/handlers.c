@@ -334,6 +334,322 @@ ps_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct jso
     perror("execvp failed");
 }
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+typedef struct stream_context_st
+{
+    struct list_head list;
+    rpc_server_st * svr;
+    int pid;
+    int fd;
+    char * tag;
+    struct uloop_fd pipe_fd;
+    struct runqueue_process run_proc;
+    char * buffer;
+    size_t buffer_len;
+    struct uloop_timeout flush_timer;
+    struct uloop_timeout heartbeat_timer;
+} stream_context_st;
+
+static LIST_HEAD(streams);
+
+static void
+stream_send_notification(stream_context_st * ctx, char const * type, char const * data)
+{
+    struct json_object * res = json_object_new_object();
+    json_object_object_add(res, "jsonrpc", json_object_new_string("2.0"));
+    json_object_object_add(res, "method", json_object_new_string("notifications/stream_data"));
+
+    struct json_object * params = json_object_new_object();
+    json_object_object_add(params, "type", json_object_new_string(type));
+    json_object_object_add(params, "pid", json_object_new_int(ctx->pid));
+    json_object_object_add(params, "fd", json_object_new_int(ctx->fd));
+    if (ctx->tag)
+    {
+        json_object_object_add(params, "tag", json_object_new_string(ctx->tag));
+    }
+
+    char ts[32];
+    current_timestamp_str(ts, sizeof(ts));
+    json_object_object_add(params, "timestamp", json_object_new_string(ts));
+
+    if (data)
+    {
+        json_object_object_add(params, "data", json_object_new_string(data));
+    }
+
+    json_object_object_add(res, "params", params);
+    rpc_server_queue_response(ctx->svr, res);
+    json_object_put(res);
+}
+
+static void
+stream_flush(stream_context_st * ctx)
+{
+    if (ctx->buffer_len > 0)
+    {
+        stream_send_notification(ctx, "data", ctx->buffer);
+        ctx->buffer_len = 0;
+        ctx->buffer[0] = '\0';
+    }
+}
+
+static void
+stream_flush_timer_cb(struct uloop_timeout * t)
+{
+    stream_context_st * ctx = container_of(t, stream_context_st, flush_timer);
+    stream_flush(ctx);
+}
+
+static void
+stream_heartbeat_timer_cb(struct uloop_timeout * t)
+{
+    stream_context_st * ctx = container_of(t, stream_context_st, heartbeat_timer);
+    stream_flush(ctx);
+    stream_send_notification(ctx, "heartbeat", NULL);
+    uloop_timeout_set(t, 10000); /* 10s heartbeat */
+}
+
+static void
+stream_pipe_cb(struct uloop_fd * u, unsigned int events)
+{
+    UNUSED_PARAM(events);
+    stream_context_st * ctx = container_of(u, stream_context_st, pipe_fd);
+    char buf[1024];
+    ssize_t n;
+
+    while ((n = read(u->fd, buf, sizeof(buf))) > 0)
+    {
+        char * new_buffer = realloc(ctx->buffer, ctx->buffer_len + n + 1);
+        if (!new_buffer)
+        {
+            perror("realloc failed");
+            return;
+        }
+        ctx->buffer = new_buffer;
+        memcpy(ctx->buffer + ctx->buffer_len, buf, n);
+        ctx->buffer_len += n;
+        ctx->buffer[ctx->buffer_len] = '\0';
+
+        if (ctx->buffer_len >= 1024)
+        {
+            stream_flush(ctx);
+        }
+        else
+        {
+            uloop_timeout_set(&ctx->flush_timer, 1000); /* Flush in 1s if no more data */
+        }
+        uloop_timeout_set(&ctx->heartbeat_timer, 10000); /* Reset heartbeat */
+    }
+
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+    {
+        uloop_fd_delete(u);
+        close(u->fd);
+        u->fd = -1;
+    }
+}
+
+static void
+stream_free(stream_context_st * ctx)
+{
+    list_del(&ctx->list);
+    if (ctx->pipe_fd.fd != -1)
+    {
+        uloop_fd_delete(&ctx->pipe_fd);
+        close(ctx->pipe_fd.fd);
+    }
+    uloop_timeout_cancel(&ctx->flush_timer);
+    uloop_timeout_cancel(&ctx->heartbeat_timer);
+    free(ctx->tag);
+    free(ctx->buffer);
+    free(ctx);
+}
+
+static void
+stream_task_complete_cb(struct runqueue * q, struct runqueue_task * t)
+{
+    (void)q;
+    stream_context_st * ctx = container_of(t, stream_context_st, run_proc.task);
+    stream_flush(ctx);
+    stream_send_notification(ctx, "exit", NULL);
+    stream_free(ctx);
+}
+
+static void
+stream_run_cb(struct runqueue * q, struct runqueue_task * t)
+{
+    stream_context_st * ctx = container_of(t, stream_context_st, run_proc.task);
+    int pipefds[2];
+
+    if (pipe(pipefds) < 0)
+    {
+        perror("pipe failed");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        perror("fork failed");
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return;
+    }
+    fprintf(stderr, "starting stream for PID %d FD %d tag %s\n", ctx->pid, ctx->fd, ctx->tag);
+    if (pid == 0)
+    {
+        /* Child */
+        close(pipefds[0]);
+        dup2(pipefds[1], STDOUT_FILENO);
+        dup2(pipefds[1], STDERR_FILENO);
+        close(pipefds[1]);
+
+        char path[256];
+        snprintf(path, sizeof(path), "/proc/%d/fd/%d", ctx->pid, ctx->fd);
+        execlp("tail", "tail", "-f", path, (char *)NULL);
+        perror("execlp failed");
+        exit(1);
+    }
+
+    /* Parent */
+    close(pipefds[1]);
+    int flags = fcntl(pipefds[0], F_GETFL, 0);
+    fcntl(pipefds[0], F_SETFL, flags | O_NONBLOCK);
+
+    ctx->pipe_fd.fd = pipefds[0];
+    uloop_fd_add(&ctx->pipe_fd, ULOOP_READ);
+
+    runqueue_process_add(q, &ctx->run_proc, pid);
+}
+
+static const struct runqueue_task_type stream_task_type = {
+    .run = stream_run_cb,
+    .cancel = runqueue_process_cancel_cb,
+    .kill = runqueue_process_kill_cb,
+};
+
+static struct json_object *
+tail_fd_list_cb(tool_definition_st const * definition, rpc_server_st * svr)
+{
+    (void)svr;
+    struct json_object * tool = json_object_new_object();
+    json_object_object_add(tool, "name", json_object_new_string(definition->name));
+    json_object_object_add(tool, "description", json_object_new_string(definition->description));
+
+    struct json_object * input_schema = json_object_new_object();
+    json_object_object_add(input_schema, "type", json_object_new_string("object"));
+
+    struct json_object * properties = json_object_new_object();
+
+    struct json_object * action_prop = json_object_new_object();
+    json_object_object_add(action_prop, "type", json_object_new_string("string"));
+    struct json_object * enum_array = json_object_new_array();
+    json_object_array_add(enum_array, json_object_new_string("start"));
+    json_object_array_add(enum_array, json_object_new_string("stop"));
+    json_object_object_add(action_prop, "enum", enum_array);
+    json_object_object_add(properties, "action", action_prop);
+
+    struct json_object * pid_prop = json_object_new_object();
+    json_object_object_add(pid_prop, "type", json_object_new_string("integer"));
+    json_object_object_add(properties, "pid", pid_prop);
+
+    struct json_object * fd_prop = json_object_new_object();
+    json_object_object_add(fd_prop, "type", json_object_new_string("integer"));
+    json_object_object_add(properties, "fd", fd_prop);
+
+    struct json_object * tag_prop = json_object_new_object();
+    json_object_object_add(tag_prop, "type", json_object_new_string("string"));
+    json_object_object_add(properties, "tag", tag_prop);
+
+    json_object_object_add(input_schema, "properties", properties);
+
+    struct json_object * required = json_object_new_array();
+    json_object_array_add(required, json_object_new_string("action"));
+    json_object_array_add(required, json_object_new_string("pid"));
+    json_object_array_add(required, json_object_new_string("fd"));
+    json_object_object_add(input_schema, "required", required);
+
+    json_object_object_add(tool, "inputSchema", input_schema);
+
+    return tool;
+}
+
+static void
+tail_fd_run_cb(tool_definition_st const * definition, rpc_server_st * svr, struct json_object * params, int out_fd)
+{
+    (void)definition;
+    fprintf(stderr, "%s\n", __func__);
+
+    struct json_object * args = NULL;
+    json_object_object_get_ex(params, "arguments", &args);
+
+    struct json_object * action_obj = NULL;
+    json_object_object_get_ex(args, "action", &action_obj);
+    char const * action = json_object_get_string(action_obj);
+
+    struct json_object * pid_obj = NULL;
+    json_object_object_get_ex(args, "pid", &pid_obj);
+    int pid = json_object_get_int(pid_obj);
+
+    struct json_object * fd_obj = NULL;
+    json_object_object_get_ex(args, "fd", &fd_obj);
+    int fd = json_object_get_int(fd_obj);
+
+    struct json_object * tag_obj = NULL;
+    json_object_object_get_ex(args, "tag", &tag_obj);
+    char const * tag = tag_obj ? json_object_get_string(tag_obj) : NULL;
+
+    if (strcmp(action, "start") == 0)
+    {
+        stream_context_st * ctx = calloc(1, sizeof(*ctx));
+        ctx->svr = svr;
+        ctx->pid = pid;
+        ctx->fd = fd;
+        ctx->tag = tag ? strdup(tag) : NULL;
+        ctx->pipe_fd.cb = stream_pipe_cb;
+        ctx->pipe_fd.fd = -1;
+        ctx->run_proc.task.type = &stream_task_type;
+        ctx->run_proc.task.complete = stream_task_complete_cb;
+        ctx->buffer = malloc(4096);
+        ctx->buffer[0] = '\0';
+        ctx->buffer_len = 0;
+
+        ctx->flush_timer.cb = stream_flush_timer_cb;
+        ctx->heartbeat_timer.cb = stream_heartbeat_timer_cb;
+
+        list_add_tail(&ctx->list, &streams);
+        runqueue_task_add(&svr->tool_queue, &ctx->run_proc.task, false);
+
+        uloop_timeout_set(&ctx->heartbeat_timer, 10000);
+
+        dprintf(out_fd, "Stream started for PID %d FD %d", pid, fd);
+    }
+    else
+    {
+        stream_context_st *ctx, *tmp;
+        bool found = false;
+        list_for_each_entry_safe(ctx, tmp, &streams, list)
+        {
+            if (ctx->pid == pid && ctx->fd == fd)
+            {
+                runqueue_task_cancel(&ctx->run_proc.task, SIGTERM);
+                found = true;
+                break;
+            }
+        }
+        if (found)
+        {
+            dprintf(out_fd, "Stream stopped for PID %d FD %d", pid, fd);
+        }
+        else
+        {
+            dprintf(out_fd, "No active stream found for PID %d FD %d", pid, fd);
+        }
+    }
+}
+
 static tool_definition_st const tool_definitions[] = {
     {
         .name = "echo",
@@ -358,6 +674,12 @@ static tool_definition_st const tool_definitions[] = {
         .description = "List running processes",
         .list_handler_cb = ps_list_cb,
         .run_handler_cb = ps_run_cb,
+    },
+    {
+        .name = "tail_fd",
+        .description = "Tail a file descriptor of a process and receive asynchronous notifications",
+        .list_handler_cb = tail_fd_list_cb,
+        .run_handler_cb = tail_fd_run_cb,
     },
 };
 
