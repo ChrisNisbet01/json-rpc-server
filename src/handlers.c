@@ -1,5 +1,6 @@
 #include "handlers.h"
 
+#include "rpc.h"
 #include "server.h"
 #include "utils.h"
 
@@ -16,24 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-static void
-queue_success_response(rpc_server_st * svr, struct json_object * id, struct json_object * result)
-{
-    struct json_object * res = json_object_new_object();
-    json_object_object_add(res, "jsonrpc", json_object_new_string("2.0"));
-    json_object_object_add(res, "result", result);
-    if (id)
-    {
-        json_object_object_add(res, "id", json_object_get(id));
-    }
-    else
-    {
-        json_object_object_add(res, "id", NULL);
-    }
-    rpc_server_queue_response(svr, res);
-    json_object_put(res);
-}
 
 static bool
 handle_initialize(rpc_server_st * svr, struct json_object * params, struct json_object * id)
@@ -53,7 +36,7 @@ handle_initialize(rpc_server_st * svr, struct json_object * params, struct json_
     json_object_object_add(server_info, "version", json_object_new_string("0.1.0"));
     json_object_object_add(result, "serverInfo", server_info);
 
-    queue_success_response(svr, id, result);
+    rpc_send_response(svr, id, result);
 
     return true;
 }
@@ -396,7 +379,7 @@ handle_list_tools(rpc_server_st * svr, struct json_object * params, struct json_
 
     json_object_object_add(result, "tools", tools_array);
 
-    queue_success_response(svr, id, result);
+    rpc_send_response(svr, id, result);
 
     return true;
 }
@@ -466,7 +449,7 @@ queue_success_content(rpc_server_st * svr, struct json_object * id, char const *
     struct json_object * result = json_object_new_object();
 
     json_object_object_add(result, "content", content_array);
-    queue_success_response(svr, id, result);
+    rpc_send_response(svr, id, result);
 }
 
 static void
@@ -687,8 +670,8 @@ handle_call_tool(rpc_server_st * svr, struct json_object * params, struct json_o
 void
 rpc_server_register_handlers(rpc_server_st * svr)
 {
-    rpc_server_register_method(svr, "initialize", handle_initialize);
-    rpc_server_register_method(svr, "tools/list", handle_list_tools);
-    rpc_server_register_method(svr, "tools/call", handle_call_tool);
-    rpc_server_register_method(svr, "notifications/cancelled", handle_cancel_request);
+    rpc_register_method(svr, "initialize", handle_initialize);
+    rpc_register_method(svr, "tools/list", handle_list_tools);
+    rpc_register_method(svr, "tools/call", handle_call_tool);
+    rpc_register_method(svr, "notifications/cancelled", handle_cancel_request);
 }

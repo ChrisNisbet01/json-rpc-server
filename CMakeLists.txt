@@ -14,8 +14,6 @@ include(FetchContent)
 
 pkg_check_modules(JSON_C REQUIRED IMPORTED_TARGET json-c)
 
-add_subdirectory(/home/chris/projects/easy_pc easy_pc_build EXCLUDE_FROM_ALL)
-
 add_subdirectory(src)
 
 if(WITH_UNIT_TESTS)
